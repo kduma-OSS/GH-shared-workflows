@@ -1,0 +1,318 @@
+name: Build PHAR and Release
+
+on:
+  workflow_call:
+    inputs:
+      php-version:
+        description: 'PHP version to use'
+        required: true
+        type: string
+      binary-name:
+        description: 'Name of the binary file'
+        required: true
+        type: string
+      release:
+        description: 'Release mode (true) or snapshot mode (false)'
+        required: false
+        type: boolean
+        default: false
+      version:
+        description: 'Version string for the build'
+        required: false
+        type: string
+        default: ''
+      src-tag-name:
+        description: 'Tag name for GitHub release (e.g. v1.0.0-src)'
+        required: false
+        type: string
+        default: ''
+      bin-tag-name:
+        description: 'Tag name on bin branch (e.g. v1.0.0)'
+        required: false
+        type: string
+        default: ''
+      version-prefix:
+        description: 'Prefix for version in messages (e.g. v)'
+        required: false
+        type: string
+        default: 'v'
+      bin-branch:
+        description: 'Branch name for binary releases'
+        required: false
+        type: string
+        default: 'bin'
+      generate-release-notes:
+        description: 'Generate release notes automatically'
+        required: false
+        type: boolean
+        default: true
+      retention-days:
+        description: 'Artifact retention days for snapshot builds'
+        required: false
+        type: number
+        default: 7
+      artifact-name:
+        description: 'Name for the uploaded build artifact'
+        required: false
+        type: string
+        default: 'binary'
+      runs-on:
+        description: 'Runner to use'
+        required: false
+        type: string
+        default: 'ubuntu-latest'
+      install-dev-deps:
+        description: 'Install dev dependencies (omit --no-dev)'
+        required: false
+        type: boolean
+        default: false
+      build-binaries:
+        description: 'Build standalone binaries using phpacker'
+        required: false
+        type: boolean
+        default: false
+      phpacker-targets:
+        description: 'phpacker platform argument (available: linux, linux-arm, mac, mac-arm, win)'
+        required: false
+        type: string
+        default: 'linux, linux-arm, mac, mac-arm, win'
+
+jobs:
+  prepare:
+    name: Validate and prepare variables
+    runs-on: ubuntu-latest
+    outputs:
+      build-version: ${{ steps.build-version.outputs.version }}
+      platforms: ${{ steps.platforms.outputs.platforms }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Validate inputs
+        run: |
+          error=0
+
+          artifact_name="${{ inputs.artifact-name }}"
+          if echo "$artifact_name" | grep -qE '[{}()|.*+?^$\[\]\\]'; then
+            echo "::error::artifact-name contains regex metacharacters which may break downstream steps: $artifact_name"
+            error=1
+          fi
+
+          if [ "${{ inputs.release }}" = "true" ]; then
+            if [ -z "${{ inputs.version }}" ]; then
+              echo "::error::version is required for release builds"
+              error=1
+            fi
+            if [ -z "${{ inputs.src-tag-name }}" ]; then
+              echo "::error::src-tag-name is required for release builds"
+              error=1
+            fi
+            if [ -z "${{ inputs.bin-tag-name }}" ]; then
+              echo "::error::bin-tag-name is required for release builds"
+              error=1
+            fi
+          fi
+
+          if [ $error -ne 0 ]; then
+            exit 1
+          fi
+
+      - name: Determine build version
+        id: build-version
+        run: |
+          if [ "${{ inputs.release }}" = "true" ]; then
+            echo "version=${{ inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=$(git rev-parse --short "$GITHUB_SHA")" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Prepare platforms to build
+        id: platforms
+        if: inputs.build-binaries
+        run: |
+          platforms=$(echo '${{ inputs.phpacker-targets }}' | jq -Rc '
+            {
+              "linux":     {"platform": "linux",   "architecture": "x64", "executable": "linux/linux-x64",         "output_suffix": "" },
+              "linux-arm": {"platform": "linux",   "architecture": "arm", "executable": "linux/linux-arm",         "output_suffix": "" },
+              "mac":       {"platform": "mac",     "architecture": "x64", "executable": "mac/mac-x64",             "output_suffix": "" },
+              "mac-arm":   {"platform": "mac",     "architecture": "arm", "executable": "mac/mac-arm",             "output_suffix": "" },
+              "win":       {"platform": "windows", "architecture": "x64", "executable": "windows/windows-x64.exe", "output_suffix": ".exe" },
+              "win-arm":   {"platform": "windows", "architecture": "arm", "executable": "windows/windows-arm.exe", "output_suffix": ".exe" },
+            } as $map |
+            split(",") |
+            map(gsub("^\\s+|\\s+$";"")) |
+            map($map[.] // error("Unknown platform: \(.)"))
+          ')
+          echo "platforms=$platforms" >> "$GITHUB_OUTPUT"
+
+
+  build-phar:
+    name: Build PHAR file
+    needs: prepare
+    runs-on: ${{ inputs.runs-on }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ inputs.php-version }}
+
+      - name: Validate composer.json and composer.lock
+        run: composer validate --strict --no-check-all
+
+      - name: Cache Composer packages
+        id: composer-cache
+        uses: actions/cache@v5
+        with:
+          path: vendor
+          key: ${{ runner.os }}-php-${{ hashFiles('**/composer.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-php-
+
+      - name: Install dependencies
+        run: composer install --prefer-dist --no-progress ${{ (inputs.install-dev-deps) == false && '--no-dev' || '' }}
+
+      - name: Build PHAR archive
+        run: php ${{ inputs.binary-name }} app:build --build-version=${{ needs.prepare.outputs.build-version }}
+
+      - name: add phar extension to the built file
+        run: mv builds/${{ inputs.binary-name }} builds/${{ inputs.binary-name }}.phar
+
+      - name: Upload PHAR artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs.artifact-name }}-phar
+          path: builds/${{ inputs.binary-name }}.phar
+          retention-days: ${{ inputs.retention-days }}
+
+  build-binaries:
+    name: Build binaries file
+    needs: [prepare, build-phar]
+    if: inputs.build-binaries
+    runs-on: ${{ inputs.runs-on }}
+
+    strategy:
+      matrix:
+        target: ${{ fromJSON(needs.prepare.outputs.platforms) }}
+
+    steps:
+      - name: Build
+        run: |
+          echo "Building for ${{ matrix.target.platform }} (${{ matrix.target.architecture }})"
+
+      - uses: actions/checkout@v6
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ inputs.php-version }}
+
+      - name: Cache Composer packages
+        id: composer-cache
+        uses: actions/cache@v5
+        with:
+          path: vendor
+          key: ${{ runner.os }}-php-${{ hashFiles('**/composer.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-php-
+
+      - name: Install dependencies
+        run: composer install --prefer-dist --no-progress --dev
+
+      - name: Download PHAR artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ inputs.artifact-name }}-phar
+          path: builds/
+
+      - name: Build standalone binaries with phpacker
+        run: ./vendor/bin/phpacker build ${{ matrix.target.platform }} ${{ matrix.target.architecture }} --src=builds/${{ inputs.binary-name }}.phar --dest=builds/ --php=${{ inputs.php-version }}
+
+      - name: rename the executable
+        run: mv builds/${{ matrix.target.executable }} builds/${{ inputs.binary-name }}${{ matrix.target.output_suffix }}
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs.artifact-name }}-binary-${{ matrix.target.platform }}-${{ matrix.target.architecture }}
+          path: builds/${{ inputs.binary-name }}${{ matrix.target.output_suffix }}
+          retention-days: ${{ inputs.retention-days }}
+
+  publish:
+    name: Publish PHAR file on a binary tag
+    needs: build-phar
+    if: inputs.release
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.bin-branch }}
+
+      - name: Ensure clean builds directory exists
+        run: mkdir -p builds; rm -f builds/*
+
+      - name: Download PHAR artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ inputs.artifact-name }}-phar
+          path: builds/
+
+      - name: Save the phar without the extension
+        run: mv builds/${{ inputs.binary-name }}.phar builds/${{ inputs.binary-name }}
+
+      - name: Commit and tag update
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m 'Binary release of version ${{ inputs.version-prefix }}${{ inputs.version }}'
+          git tag -f '${{ inputs.bin-tag-name }}'
+          git push
+          git push --force origin 'refs/tags/${{ inputs.bin-tag-name }}'
+
+  release:
+    name: Make a release on a src tag
+    needs: [prepare, build-phar, build-binaries]
+    if: ${{ !failure() && !cancelled() && inputs.release }}
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download PHAR artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ inputs.artifact-name }}-phar
+          path: builds/
+
+      - name: Download binary artifacts
+        if: inputs.build-binaries
+        uses: actions/download-artifact@v7
+        with:
+          pattern: ${{ inputs.artifact-name }}-binary-*
+          path: builds/binaries/
+
+      - name: Zip binary artifacts
+        if: inputs.build-binaries
+        run: |
+          mkdir -p builds/zips
+          for dir in builds/binaries/${{ inputs.artifact-name }}-binary-*/; do
+            name=$(basename "$dir" | sed 's/^${{ inputs.artifact-name }}-binary-//')
+            (cd "$dir" && zip -j "../../zips/${name}.zip" *)
+          done
+        shell: bash
+
+      - name: Release source
+        uses: softprops/action-gh-release@v2.5.0
+        with:
+          files: |
+            builds/${{ inputs.binary-name }}.phar
+            builds/zips/*.zip
+          tag_name: ${{ inputs.src-tag-name }}
+          name: ${{ inputs.binary-name }} ${{ inputs.version-prefix }}${{ inputs.version }} release
+          generate_release_notes: ${{ inputs.generate-release-notes }}
